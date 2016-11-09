@@ -35,6 +35,32 @@ def reorient(in_file):
     nii.to_filename(outfile)
     return os.path.abspath(outfile)
 
+
+def reorient_and_discard_non_steady(in_file):
+    import nibabel as nb
+    import os
+    import numpy as np
+    import nibabel as nb
+    from statsmodels.robust.scale import mad
+
+    _, outfile = os.path.split(in_file)
+
+    nii = nb.as_closest_canonical(nb.load(in_file))
+    in_data = nii.get_data()
+    data = in_data[:, :, :, :50]
+    timeseries = data.max(axis=0).max(axis=0).max(axis=0)
+    outlier_timecourse = (timeseries - np.median(timeseries)) / mad(
+        timeseries)
+    exclude_index = 0
+    for i in range(10):
+        if outlier_timecourse[i] > 10:
+            exclude_index += 1
+        else:
+            break
+
+    nb.Nifti1Image(in_data[:, :, :, exclude_index:], nii.affine).to_filename(outfile)
+    return exclude_index, os.path.abspath(outfile)
+
 def check_folder(folder):
     if not op.exists(folder):
         try:
@@ -194,7 +220,6 @@ ocol/blob/master/scripts/qap_bids_data_sublist_generator.py
 
 def gather_bids_data(dataset_folder, subject_inclusion=None, include_types=None):
     """ Extract data from BIDS root folder """
-    import os
     import os.path as op
     from six import string_types
     import yaml
@@ -400,3 +425,18 @@ def _flatten(in_dict, parent_key='', sep='_'):
         else:
             items.append((new_key, val))
     return dict(items)
+
+
+def _flatten_dict(indict):
+    out_qc = {}
+    for k, value in list(indict.items()):
+        if not isinstance(value, dict):
+            out_qc[k] = value
+        else:
+            for subk, subval in list(value.items()):
+                if not isinstance(subval, dict):
+                    out_qc['_'.join([k, subk])] = subval
+                else:
+                    for ssubk, ssubval in list(subval.items()):
+                        out_qc['_'.join([k, subk, ssubk])] = ssubval
+    return out_qc

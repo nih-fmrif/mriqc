@@ -11,10 +11,10 @@ from matplotlib.cm import get_cmap
 from matplotlib import gridspec as mgs
 from matplotlib.colors import Normalize, LinearSegmentedColormap
 from matplotlib.colorbar import ColorbarBase
-from seaborn import color_palette
-from mriqc.interfaces.viz_utils import DINA4_LANDSCAPE
-
 import seaborn as sns
+from seaborn import color_palette
+
+from mriqc.interfaces.viz_utils import DINA4_LANDSCAPE
 sns.set_style("whitegrid")
 
 class fMRIPlot(object):
@@ -75,7 +75,7 @@ class fMRIPlot(object):
         # spikesplot_cb([0.7, 0.78, 0.2, 0.008])
 
 
-def fmricarpetplot(func_data, segmentation, outer_gs, tr=None, nskip=4):
+def fmricarpetplot(func_data, segmentation, outer_gs, tr=None, nskip=0):
     """
     Plot "the plot"
     """
@@ -131,8 +131,8 @@ def fmricarpetplot(func_data, segmentation, outer_gs, tr=None, nskip=4):
 
     # Carpet plot
     ax1 = plt.subplot(gs[1])
-    theplot = ax1.imshow(detrended[order, :], interpolation='nearest',
-                         aspect='auto', cmap='gray', vmin=-2, vmax=2)
+    ax1.imshow(detrended[order, :], interpolation='nearest',
+               aspect='auto', cmap='gray', vmin=-2, vmax=2)
 
     ax1.grid(False)
     ax1.set_yticks([])
@@ -173,7 +173,7 @@ def fmricarpetplot(func_data, segmentation, outer_gs, tr=None, nskip=4):
 
 
 def spikesplot(ts_z, outer_gs=None, tr=None, zscored=True, spike_thresh=6., title='Spike plot',
-               ax=None, cmap='viridis', hide_x=True, nskip=4):
+               ax=None, cmap='viridis', hide_x=True, nskip=0):
     """
     A spikes plot. Thanks to Bob Dogherty (this docstring needs be improved with proper ack)
     """
@@ -187,9 +187,7 @@ def spikesplot(ts_z, outer_gs=None, tr=None, zscored=True, spike_thresh=6., titl
         ax = plt.subplot(gs[1])
 
     # Define TR and number of frames
-    notr = False
     if tr is None:
-        notr = True
         tr = 1.
 
     # Load timeseries, zscored slice-wise
@@ -282,7 +280,7 @@ def spikesplot(ts_z, outer_gs=None, tr=None, zscored=True, spike_thresh=6., titl
     ax.spines["left"].set_position(('outward', 30))
     ax.yaxis.set_ticks_position('left')
 
-    labels = [label for label in ax.yaxis.get_ticklabels()]
+    # labels = [label for label in ax.yaxis.get_ticklabels()]
     # labels[0].set_weight('bold')
     # labels[-1].set_weight('bold')
     if title:
@@ -306,7 +304,7 @@ def spikesplot_cb(position, cmap='viridis', fig=None):
 
 
 def confoundplot(tseries, gs_ts, gs_dist=None, name=None, normalize=True,
-                 units=None, tr=None, hide_x=True, color='b', nskip=4,
+                 units=None, tr=None, hide_x=True, color='b', nskip=0,
                  cutoff=None, ylims=None):
 
     # Define TR and number of frames
@@ -368,9 +366,9 @@ def confoundplot(tseries, gs_ts, gs_dist=None, name=None, normalize=True,
 
     # Plot average
     if cutoff is None:
-        cutoff = [tseries[nskip:].mean()]
-    else:
-        cutoff.insert(0, tseries[nskip:].mean())
+        cutoff = []
+
+    cutoff.insert(0, tseries[~np.isnan(tseries)].mean())
 
     for i, thr in enumerate(cutoff):
         ax_ts.plot((0, ntsteps - 1), [thr] * 2,
@@ -378,7 +376,20 @@ def confoundplot(tseries, gs_ts, gs_dist=None, name=None, normalize=True,
                    linestyle='-' if i == 0 else ':',
                    color=color if i == 0 else 'k')
 
-    def_ylims = [0.95 * tseries[nskip:].min(), 1.1 * tseries[nskip:].max()]
+        if i == 0:
+            mean_label = r'$\mu$=%.3f%s' % (thr, units if units is not None else '')
+            ax_ts.annotate(
+                mean_label, xy=(ntsteps - 1, thr), xytext=(11, 0),
+                textcoords='offset points', va='center',
+                color='w', fontsize='small',
+                bbox=dict(boxstyle='round', fc=color, ec=color, color='w', lw=1),
+                arrowprops=dict(arrowstyle='wedge,tail_width=0.6', lw=0,
+                                fc=color, ec=color, relpos=(0.5, 0.5),
+                                ))
+
+
+    def_ylims = [0.95 * tseries[~np.isnan(tseries)].min(),
+                 1.1 * tseries[~np.isnan(tseries)].max()]
     if ylims is not None:
         if ylims[0] is not None:
             def_ylims[0] = min([def_ylims[0], ylims[0]])
@@ -386,6 +397,9 @@ def confoundplot(tseries, gs_ts, gs_dist=None, name=None, normalize=True,
             def_ylims[1] = max([def_ylims[1], ylims[1]])
 
     ax_ts.set_ylim(def_ylims)
+    yticks = sorted(def_ylims)
+    ax_ts.set_yticks(yticks)
+    ax_ts.set_yticklabels(['%.02f' % y for y in yticks])
 
     if not gs_dist is None:
         ax_dist = plt.subplot(gs_dist)
