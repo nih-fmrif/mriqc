@@ -17,16 +17,19 @@ from multiprocessing import cpu_count
 from argparse import ArgumentParser
 from argparse import RawTextHelpFormatter
 
-from mriqc.workflows import core as mwc
 from mriqc import __version__, MRIQC_LOG
 from mriqc.utils.misc import check_folder
 
 DEFAULT_MEM_GB = 8
 
 def main():
-    from nipype import config as ncfg
-
     """Entry point"""
+    from nipype import config as ncfg
+    from nipype.pipeline.engine import Workflow
+    from mriqc.utils.bids import collect_bids_data
+    from mriqc.workflows.core import build_workflow
+    from mriqc.reports.utils import check_reports
+
     parser = ArgumentParser(description='MRI Quality Control',
                             formatter_class=RawTextHelpFormatter)
 
@@ -56,7 +59,8 @@ def main():
 
     g_input = parser.add_argument_group('mriqc specific inputs')
     g_input.add_argument('-d', '--data-type', action='store', nargs='*',
-                         choices=['anat', 'func'], default=['anat', 'func'])
+                         choices=['anat', 'anatomical', 'func', 'functional'],
+                         default=['anat', 'func'])
     g_input.add_argument('-s', '--session-id', action='store')
     g_input.add_argument('-r', '--run-id', action='store')
     g_input.add_argument('--nthreads', action='store', type=int,
@@ -206,22 +210,40 @@ def main():
         'Running MRIQC-%s (analysis_level=%s, participant_label=%s)\n\tSettings=%s',
         __version__, opts.analysis_level, opts.participant_label, settings)
 
+    # Process data types
+    qc_types = []
+    modalities = []
+    for qcdt in sorted(list(set([qcdt[:4] for qcdt in opts.data_type]))):
+        if qcdt.startswith('anat'):
+            qc_types.append('anatomical')
+            modalities.append('t1w')
+        if qcdt.startswith('func'):
+            qc_types.append('functional')
+            modalities.append('func')
+
+    dataset = collect_bids_data(settings['bids_dir'],
+                                participant_label=opts.participant_label)
+
     # Set up participant level
     if opts.analysis_level == 'participant':
-        for qctype in opts.data_type:
-            ms_func = getattr(mwc, 'ms_' + qctype)
-            workflow = ms_func(subject_id=opts.participant_label, session_id=opts.session_id,
-                               run_id=opts.run_id, settings=settings)
-            if workflow is None:
-                MRIQC_LOG.warn('No scans were found for the given inputs')
+        workflow = Workflow(name='workflow_enumerator')
+        workflow.base_dir = settings['work_dir']
+
+        wf_list = []
+        for qctype, mod in zip(qc_types, modalities):
+            if not dataset[mod]:
+                MRIQC_LOG.warn('No %s scans were found in %s', qctype, settings['bids_dir'])
                 continue
 
-            workflow.base_dir = settings['work_dir']
-            if settings.get('write_graph', False):
-                workflow.write_graph()
+            wf_list.append(build_workflow(dataset[mod], qctype, settings=settings))
+
+        if wf_list:
+            workflow.add_nodes(wf_list)
 
             if not opts.dry_run:
                 workflow.run(**plugin_settings)
+                if check_reports(dataset, settings):
+                    MRIQC_LOG.warn('Some reports were not generated')
 
     # Set up group level
     if opts.analysis_level == 'group' or opts.participant_label is None:
@@ -232,23 +254,25 @@ def main():
         reports_dir = check_folder(op.join(settings['output_dir'], 'reports'))
 
         derivatives_dir = op.join(settings['output_dir'], 'derivatives')
-        for qctype in opts.data_type:
+        for qctype in qc_types:
             qcjson = op.join(derivatives_dir, '{}*.json'.format(qctype[:4]))
-
-            # If there are no iqm.json files, nothing to do.
-            if not qcjson:
-                MRIQC_LOG.warn(
-                    'Generating group-level report for the "%s" data type - '
-                    'no IQM-JSON files were found in "%s"', qctype, derivatives_dir)
-                continue
-
             # If some were found, generate the CSV file and group report
             out_csv = op.join(settings['output_dir'], qctype[:4] + 'MRIQC.csv')
+            dataframe = generate_csv(glob(qcjson), out_csv)
+
+            # If there are no iqm.json files, nothing to do.
+            if dataframe is None:
+                MRIQC_LOG.warn(
+                    'No IQM-JSON files were found for the %s data type in %s. The group-level '
+                    'report was not generated.', qctype, derivatives_dir)
+                continue
+
             out_html = op.join(reports_dir, qctype[:4] + '_group.html')
-            generate_csv(glob(qcjson), out_csv)
-            MRIQC_LOG.info('Summary CSV table has been written to %s', out_csv)
-            group_html(out_csv, qctype, out_file=out_html)
-            MRIQC_LOG.info('Group HTML report has been written to %s', out_html)
+            MRIQC_LOG.info('Summary CSV table for the %s data generated (%s)', qctype, out_csv)
+            group_html(out_csv, qctype,
+                       csv_failed=op.join(settings['output_dir'], 'failed_' + qctype + '.csv'),
+                       out_file=out_html)
+            MRIQC_LOG.info('Group-%s report generated (%s)', qctype, out_html)
 
 if __name__ == '__main__':
     main()

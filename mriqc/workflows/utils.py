@@ -7,7 +7,7 @@
 # @Date:   2016-01-05 17:15:12
 # @Email:  code@oscaresteban.es
 # @Last modified by:   oesteban
-# @Last Modified time: 2016-11-07 11:35:58
+# @Last Modified time: 2016-11-15 09:28:44
 """Helper functions for the workflows"""
 from __future__ import print_function, division, absolute_import, unicode_literals
 from builtins import range
@@ -66,7 +66,6 @@ def fd_jenkinson(in_file, rmax=80., out_file=None):
 
     """
 
-    import sys
     import math
     import os.path as op
     import numpy as np
@@ -153,13 +152,14 @@ def spectrum_mask(size):
     ftmask[ftmask < 1] = 0
     return ftmask
 
-def slice_wise_fft(in_file, ftmask=None, spike_thres=12., out_prefix=None):
+def slice_wise_fft(in_file, ftmask=None, spike_thres=10., out_prefix=None):
     """Search for spikes in slices using the 2D FFT"""
     import os.path as op
     import numpy as np
     import nibabel as nb
     from mriqc.workflows.utils import spectrum_mask
     from scipy.ndimage.filters import median_filter
+    from scipy.ndimage import generate_binary_structure, binary_erosion
     from statsmodels.robust.scale import mad
 
 
@@ -195,23 +195,34 @@ def slice_wise_fft(in_file, ftmask=None, spike_thres=12., out_prefix=None):
     fft_zscored = fft_data - mu[..., np.newaxis]
     fft_zscored[idxs] /= sigma[idxs]
 
+    # save fft z-scored
+    out_fft = op.abspath(out_prefix + '_zsfft.nii.gz')
+    nii = nb.Nifti1Image(fft_zscored, nb.load(in_file).get_affine(), None)
+    nii.to_filename(out_fft)
+
     # Find peaks
     spikes_list = []
-    for t in range(fft_data.shape[-1]):
+    for t in range(fft_zscored.shape[-1]):
         fft_frame = fft_zscored[..., t]
 
         for z in range(fft_frame.shape[-1]):
             sl = fft_frame[..., z]
+            if np.all(sl < spike_thres):
+                continue
 
             # Any zscore over spike_thres will be called a spike
-            if np.any(sl > spike_thres):
+            sl[sl <= spike_thres] = 0
+            sl[sl > 0] = 1
+
+            # Erode peaks and see how many survive
+            struc = generate_binary_structure(2, 2)
+            sl = binary_erosion(sl.astype(np.uint8), structure=struc).astype(np.uint8)
+
+            if sl.sum() > 10:
                 spikes_list.append((t, z))
 
     out_spikes = op.abspath(out_prefix + '_spikes.tsv')
     np.savetxt(out_spikes, spikes_list, fmt=b'%d', delimiter=b'\t', header='TR\tZ')
 
-    out_fft = op.abspath(out_prefix + '_zsfft.nii.gz')
-    nii = nb.Nifti1Image(fft_zscored, nb.load(in_file).get_affine(), None)
-    nii.to_filename(out_fft)
 
     return len(spikes_list), out_spikes, out_fft

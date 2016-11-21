@@ -18,40 +18,29 @@ from nipype.interfaces import utility as niu
 from nipype.interfaces import fsl
 from nipype.interfaces import afni
 
-from mriqc.workflows.utils import (fmri_getidx, fwhm_dict, fd_jenkinson, thresh_image,
+from mriqc.workflows.utils import (fwhm_dict, fd_jenkinson, thresh_image,
                                    slice_wise_fft)
-from mriqc.interfaces.functional import FunctionalQC, Spikes
-from mriqc.utils.misc import bids_getfile, bids_path, check_folder, reorient_and_discard_non_steady
+from mriqc.interfaces import ReadSidecarJSON, FunctionalQC, Spikes
+from mriqc.utils.misc import bids_path, check_folder, reorient_and_discard_non_steady
 
 DEFAULT_FD_RADIUS = 50.
 
 
-def fmri_qc_workflow(name='fMRIQC', settings=None):
+def fmri_qc_workflow(dataset, settings, name='funcMRIQC'):
     """ The fMRI qc workflow """
-
-    if settings is None:
-        settings = {}
 
     workflow = pe.Workflow(name=name)
 
     # Define workflow, inputs and outputs
-    inputnode = pe.Node(niu.IdentityInterface(
-        fields=['bids_dir', 'subject_id', 'session_id', 'run_id',
-                'site_name', 'start_idx', 'stop_idx']), name='inputnode')
-    get_idx = pe.Node(niu.Function(
-        input_names=['in_file', 'start_idx', 'stop_idx'], function=fmri_getidx,
-        output_names=['start_idx', 'stop_idx']), name='get_idx')
+    # 0. Get data, put it in RAS orientation
+    inputnode = pe.Node(niu.IdentityInterface(fields=['in_file']), name='inputnode')
+    inputnode.iterables = [('in_file', dataset)]
+    meta = pe.Node(ReadSidecarJSON(), name='metadata')
 
     outputnode = pe.Node(niu.IdentityInterface(
         fields=['qc', 'mosaic', 'out_group', 'out_dvars',
                 'out_fd']), name='outputnode')
 
-    # 0. Get data, put it in RAS orientation
-    datasource = pe.Node(niu.Function(
-        input_names=[
-            'bids_dir', 'data_type', 'subject_id', 'session_id', 'run_id'],
-        output_names=['out_file'], function=bids_getfile), name='datasource')
-    datasource.inputs.data_type = 'func'
 
     reorient_and_discard = pe.Node(niu.Function(input_names=['in_file'],
                                                 output_names=['exclude_index',
@@ -67,7 +56,14 @@ def fmri_qc_workflow(name='fMRIQC', settings=None):
         hmcwf = hmc_afni(st_correct=settings.get('correct_slice_timing', False),
                          despike=settings.get('despike', False),
                          deoblique=settings.get('deoblique', False))
+
+    # Set HMC settings
     hmcwf.inputs.inputnode.fd_radius = settings.get('fd_radius', DEFAULT_FD_RADIUS)
+    if settings.get('start_idx'):
+        hmcwf.inputs.inputnode.start_idx = settings['start_idx']
+    if settings.get('stop_idx'):
+        hmcwf.inputs.inputnode.stop_idx = settings['stop_idx']
+
 
     mean = pe.Node(afni.TStat(                   # 2. Compute mean fmri
         options='-mean', outputtype='NIFTI_GZ'), name='mean')
@@ -75,7 +71,8 @@ def fmri_qc_workflow(name='fMRIQC', settings=None):
         use_bet=settings.get('use_bet', False))
 
     # EPI to MNI registration
-    ema = epi_mni_align()
+    ema = epi_mni_align(ants_nthreads=settings['ants_nthreads'],
+                        testing=settings.get('testing', False))
 
     # Compute TSNR using nipype implementation
     tsnr = pe.Node(nac.TSNR(), name='compute_tsnr')
@@ -86,25 +83,18 @@ def fmri_qc_workflow(name='fMRIQC', settings=None):
     repwf = individual_reports(settings)
 
     workflow.connect([
-        (inputnode, datasource, [('bids_dir', 'bids_dir'),
-                                 ('subject_id', 'subject_id'),
-                                 ('session_id', 'session_id'),
-                                 ('run_id', 'run_id')]),
-        (inputnode, get_idx, [('start_idx', 'start_idx'),
-                              ('stop_idx', 'stop_idx')]),
-        (datasource, get_idx, [('out_file', 'in_file')]),
-        (datasource, reorient_and_discard, [('out_file', 'in_file')]),
+        (inputnode, meta, [('in_file', 'in_file')]),
+        (inputnode, reorient_and_discard, [('in_file', 'in_file')]),
         (reorient_and_discard, hmcwf, [('out_file', 'inputnode.in_file')]),
-        (get_idx, hmcwf, [('start_idx', 'inputnode.start_idx'),
-                          ('stop_idx', 'inputnode.stop_idx')]),
         (hmcwf, bmw, [('outputnode.out_file', 'inputnode.in_file')]),
         (hmcwf, mean, [('outputnode.out_file', 'in_file')]),
         (hmcwf, tsnr, [('outputnode.out_file', 'in_file')]),
         (mean, ema, [('out_file', 'inputnode.epi_mean')]),
         (bmw, ema, [('outputnode.out_file', 'inputnode.epi_mask')]),
-        (inputnode, iqmswf, [('subject_id', 'inputnode.subject_id'),
-                             ('session_id', 'inputnode.session_id'),
-                             ('run_id', 'inputnode.run_id')]),
+        (meta, iqmswf, [('subject_id', 'inputnode.subject_id'),
+                        ('session_id', 'inputnode.session_id'),
+                        ('task_id', 'inputnode.task_id'),
+                        ('run_id', 'inputnode.run_id')]),
         (reorient_and_discard, iqmswf, [('out_file', 'inputnode.orig')]),
         (mean, iqmswf, [('out_file', 'inputnode.epi_mean')]),
         (hmcwf, iqmswf, [('outputnode.out_file', 'inputnode.hmc_epi'),
@@ -112,9 +102,11 @@ def fmri_qc_workflow(name='fMRIQC', settings=None):
         (bmw, iqmswf, [('outputnode.out_file', 'inputnode.brainmask')]),
         (tsnr, iqmswf, [('tsnr_file', 'inputnode.in_tsnr')]),
 
-        (inputnode, repwf, [('subject_id', 'inputnode.subject_id'),
-                            ('session_id', 'inputnode.session_id'),
-                            ('run_id', 'inputnode.run_id')]),
+        (meta, repwf, [('subject_id', 'inputnode.subject_id'),
+                       ('session_id', 'inputnode.session_id'),
+                       ('task_id', 'inputnode.task_id'),
+                       ('run_id', 'inputnode.run_id'),
+                       ('out_dict', 'inputnode.in_metadata')]),
         (reorient_and_discard, repwf, [('out_file', 'inputnode.orig')]),
         (mean, repwf, [('out_file', 'inputnode.epi_mean')]),
         (tsnr, repwf, [('stddev_file', 'inputnode.in_stddev')]),
@@ -135,7 +127,7 @@ def compute_iqms(settings, name='ComputeIQMs'):
     """Workflow that actually computes the IQMs"""
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(niu.IdentityInterface(fields=[
-        'subject_id', 'session_id', 'run_id', 'orig', 'epi_mean',
+        'subject_id', 'session_id', 'task_id', 'run_id', 'orig', 'epi_mean',
         'brainmask', 'hmc_epi', 'hmc_fd', 'in_tsnr']), name='inputnode')
     outputnode = pe.Node(niu.IdentityInterface(
         fields=['out_file', 'out_dvars', 'outliers', 'out_spikes', 'out_fft']),
@@ -144,8 +136,7 @@ def compute_iqms(settings, name='ComputeIQMs'):
     deriv_dir = check_folder(op.abspath(op.join(settings['output_dir'], 'derivatives')))
 
     # Compute DVARS
-    dvnode = pe.Node(nac.ComputeDVARS(remove_zerovariance=True, save_plot=False,
-                                      save_all=True), name='ComputeDVARS')
+    dvnode = pe.Node(nac.ComputeDVARS(save_plot=False, save_all=True), name='ComputeDVARS')
 
     # AFNI quality measures
     fwhm = pe.Node(afni.FWHMx(combine=True, detrend=True), name='smoothness')
@@ -200,6 +191,7 @@ def compute_iqms(settings, name='ComputeIQMs'):
                                ('run_id', 'runid')]),
         (inputnode, datasink, [('subject_id', 'subject_id'),
                                ('session_id', 'session_id'),
+                               ('task_id', 'task_id'),
                                ('run_id', 'run_id')]),
         (fwhm, datasink, [(('fwhm', fwhm_dict), 'fwhm')]),
         (outliers, datasink, [(('out_file', _parse_tout), 'aor')]),
@@ -235,9 +227,9 @@ def individual_reports(settings, name='ReportsWorkflow'):
 
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(niu.IdentityInterface(fields=[
-        'subject_id', 'session_id', 'run_id', 'in_iqms', 'orig', 'epi_mean',
-        'brainmask', 'hmc_fd', 'epi_parc', 'in_dvars', 'in_stddev', 'outliers',
-        'in_spikes', 'exclude_index']),
+        'subject_id', 'session_id', 'task_id', 'run_id', 'in_metadata', 'in_iqms',
+        'orig', 'epi_mean', 'brainmask', 'hmc_fd', 'epi_parc', 'in_dvars', 'in_stddev',
+        'outliers', 'in_spikes', 'exclude_index']),
         name='inputnode')
 
     spmask = pe.Node(niu.Function(
@@ -247,7 +239,8 @@ def individual_reports(settings, name='ReportsWorkflow'):
     spikes_bg = pe.Node(Spikes(no_zscore=True, detrend=False), name='SpikesFinderBgMask')
 
     bigplot = pe.Node(niu.Function(
-        input_names=['in_func', 'in_mask', 'in_segm', 'in_spikes', 'in_spikes_bg',
+        input_names=['session_id', 'task_id', 'run_id',
+                     'in_func', 'in_mask', 'in_segm', 'in_spikes', 'in_spikes_bg',
                      'fd', 'dvars', 'outliers'],
         output_names=['out_file'], function=_big_plot), name='BigPlot')
 
@@ -256,7 +249,10 @@ def individual_reports(settings, name='ReportsWorkflow'):
         (inputnode, spikes, [('orig', 'in_file'),
                              ('brainmask', 'in_mask')]),
         (inputnode, spmask, [('orig', 'in_file')]),
-        (inputnode, bigplot, [('orig', 'in_func'),
+        (inputnode, bigplot, [('session_id', 'session_id'),
+                              ('task_id', 'task_id'),
+                              ('run_id', 'run_id'),
+                              ('orig', 'in_func'),
                               ('brainmask', 'in_mask'),
                               ('hmc_fd', 'fd'),
                               ('in_dvars', 'dvars'),
@@ -270,23 +266,23 @@ def individual_reports(settings, name='ReportsWorkflow'):
 
     mosaic_mean = pe.Node(PlotMosaic(
         out_file='plot_func_mean_mosaic1.svg',
-        title='EPI mean session: {session_id} run: {run_id}',
+        title='EPI mean session',
         cmap='Greys_r'),
         name='PlotMosaicMean')
 
     mosaic_stddev = pe.Node(PlotMosaic(
         out_file='plot_func_stddev_mosaic2_stddev.svg',
-        title='EPI SD session: {session_id} run: {run_id}',
+        title='EPI SD session',
         cmap='viridis'), name='PlotMosaicSD')
 
     mosaic_spikes = pe.Node(PlotSpikes(
         out_file='plot_spikes.svg', cmap='viridis',
-        title='High-Frequency spikes (session: {session_id}, run: {run_id})'),
+        title='High-Frequency spikes'),
                             name='PlotSpikes')
 
     mplots = pe.Node(niu.Merge(pages + extra_pages), name='MergePlots')
     rnode = pe.Node(niu.Function(
-        input_names=['in_iqms', 'in_plots', 'exclude_index', 'wf_details'],
+        input_names=['in_iqms', 'in_metadata', 'in_plots', 'exclude_index', 'wf_details'],
         output_names=['out_file'], function=individual_html), name='GenerateReport')
     wf_details = []
     if settings.get('hmc_afni', False):
@@ -303,17 +299,21 @@ def individual_reports(settings, name='ReportsWorkflow'):
 
     workflow.connect([
         (inputnode, rnode, [('in_iqms', 'in_iqms'),
+                            ('in_metadata', 'in_metadata'),
                             ('exclude_index', 'exclude_index')]),
         (inputnode, mosaic_mean, [('subject_id', 'subject_id'),
                                   ('session_id', 'session_id'),
+                                  ('task_id', 'task_id'),
                                   ('run_id', 'run_id'),
                                   ('epi_mean', 'in_file')]),
         (inputnode, mosaic_stddev, [('subject_id', 'subject_id'),
                                     ('session_id', 'session_id'),
+                                    ('task_id', 'task_id'),
                                     ('run_id', 'run_id'),
                                     ('in_stddev', 'in_file')]),
         (inputnode, mosaic_spikes, [('subject_id', 'subject_id'),
                                     ('session_id', 'session_id'),
+                                    ('task_id', 'task_id'),
                                     ('run_id', 'run_id'),
                                     ('orig', 'in_file'),
                                     ('in_spikes', 'in_spikes')]),
@@ -330,17 +330,17 @@ def individual_reports(settings, name='ReportsWorkflow'):
 
     mosaic_zoom = pe.Node(PlotMosaic(
         out_file='plot_anat_mosaic1_zoomed.svg',
-        title='EPI mean (zoomed) session: {session_id} run: {run_id}',
+        title='Zoomed-in EPI mean',
         cmap='Greys_r'), name='PlotMosaicZoomed')
 
     mosaic_noise = pe.Node(PlotMosaic(
         out_file='plot_anat_mosaic2_noise.svg',
-        title='EPI mean (noise) session: {session_id} run: {run_id}',
+        title='Enhanced noise in EPI mean',
         only_noise=True, cmap='viridis_r'), name='PlotMosaicNoise')
 
     # Verbose-reporting goes here
     from mriqc.interfaces.viz import PlotContours
-    from mriqc.interfaces.viz_utils import plot_bg_dist, combine_svg_verbose
+    from mriqc.interfaces.viz_utils import plot_bg_dist
 
     plot_bmask = pe.Node(PlotContours(
         display_mode='z', levels=[.5], colors=['r'], cut_coords=10,
@@ -351,11 +351,13 @@ def individual_reports(settings, name='ReportsWorkflow'):
                                  ('brainmask', 'in_contours')]),
         (inputnode, mosaic_zoom, [('subject_id', 'subject_id'),
                                   ('session_id', 'session_id'),
+                                  ('task_id', 'task_id'),
                                   ('run_id', 'run_id'),
                                   ('epi_mean', 'in_file'),
                                   ('brainmask', 'bbox_mask_file')]),
         (inputnode, mosaic_noise, [('subject_id', 'subject_id'),
                                    ('session_id', 'session_id'),
+                                   ('task_id', 'task_id'),
                                    ('run_id', 'run_id'),
                                    ('epi_mean', 'in_file')]),
         (mosaic_zoom, mplots, [('out_file', 'in%d' % (pages + 1))]),
@@ -549,7 +551,7 @@ def hmc_afni(name='fMRI_HMC_afni', st_correct=False, despike=False, deoblique=Fa
 
     return workflow
 
-def epi_mni_align(name='SpatialNormalization'):
+def epi_mni_align(name='SpatialNormalization', ants_nthreads=6, testing=False, resolution=2):
     """
     Uses FSL FLIRT with the BBR cost function to find the transform that
     maps the EPI space into the MNI152-nonlinear-symmetric atlas.
@@ -560,7 +562,9 @@ def epi_mni_align(name='SpatialNormalization'):
     the associated "lobe" parcellation in EPI space.
 
     """
+    from nipype.interfaces.ants import ApplyTransforms, N4BiasFieldCorrection
     from niworkflows.data import get_mni_icbm152_nlin_asym_09c as get_template
+    from niworkflows.anat.mni import RobustMNINormalization
     mni_template = get_template()
 
     workflow = pe.Workflow(name=name)
@@ -569,46 +573,38 @@ def epi_mni_align(name='SpatialNormalization'):
     outputnode = pe.Node(niu.IdentityInterface(fields=['epi_mni', 'epi_parc']),
                          name='outputnode')
 
-    # Mask PD template image
-    brainmask = pe.Node(fsl.ApplyMask(
-        in_file=op.join(mni_template, '1mm_PD.nii.gz'),
-        mask_file=op.join(mni_template, '1mm_brainmask.nii.gz')),
-        name='MNIApplyMask')
-
     epimask = pe.Node(fsl.ApplyMask(), name='EPIApplyMask')
 
-    # Extract wm mask from segmentation
-    wm_mask = pe.Node(niu.Function(input_names=['in_file'], output_names=['out_file'],
-                                   function=thresh_image), name='WM_mask')
-    wm_mask.inputs.in_file = op.join(mni_template, '1mm_tpm_wm.nii.gz')
+    n4itk = pe.Node(N4BiasFieldCorrection(dimension=3), name='SharpenEPI')
+    # Mask T2 template image
+    brainmask = pe.Node(fsl.ApplyMask(
+        in_file=op.join(mni_template, '%dmm_T2.nii.gz' % resolution),
+        mask_file=op.join(mni_template, '%dmm_brainmask.nii.gz' % resolution)),
+        name='MNIApplyMask')
 
-    flt_bbr_init = pe.Node(fsl.FLIRT(dof=6, out_matrix_file='init.mat'),
-                           name='Flirt_BBR_init')
-    flt_bbr = pe.Node(fsl.FLIRT(dof=12, cost_func='bbr'), name='Flirt_BBR')
-    flt_bbr.inputs.schedule = op.join(os.getenv('FSLDIR'),
-                                      'etc/flirtsch/bbr.sch')
+    norm = pe.Node(RobustMNINormalization(
+        num_threads=ants_nthreads, template='mni_icbm152_nlin_asym_09c',
+        testing=testing, moving='EPI'),
+                   name='EPI2MNI')
 
-    # make equivalent warp fields
-    invt_bbr = pe.Node(fsl.ConvertXFM(invert_xfm=True), name='Flirt_BBR_Inv')
     # Warp segmentation into EPI space
-    segm_xfm = pe.Node(fsl.ApplyXfm(
-        in_file=op.join(mni_template, '1mm_parc.nii.gz'),
-        interp='nearestneighbour'), name='ResampleSegmentation')
+    invt = pe.Node(ApplyTransforms(
+        input_image=op.join(mni_template, '%dmm_parc.nii.gz' % resolution),
+        dimension=3, default_value=0, interpolation='NearestNeighbor'),
+                   name='ResampleSegmentation')
 
     workflow.connect([
-        (inputnode, epimask, [('epi_mean', 'in_file'),
-                              ('epi_mask', 'mask_file')]),
-        (epimask, flt_bbr_init, [('out_file', 'in_file')]),
-        (epimask, flt_bbr, [('out_file', 'in_file')]),
-        (brainmask, flt_bbr_init, [('out_file', 'reference')]),
-        (brainmask, flt_bbr, [('out_file', 'reference')]),
-        (wm_mask, flt_bbr, [('out_file', 'wm_seg')]),
-        (flt_bbr_init, flt_bbr, [('out_matrix_file', 'in_matrix_file')]),
-        (flt_bbr, invt_bbr, [('out_matrix_file', 'in_file')]),
-        (invt_bbr, segm_xfm, [('out_file', 'in_matrix_file')]),
-        (inputnode, segm_xfm, [('epi_mean', 'reference')]),
-        (segm_xfm, outputnode, [('out_file', 'epi_parc')]),
-        (flt_bbr, outputnode, [('out_file', 'epi_mni')]),
+        (inputnode, invt, [('epi_mean', 'reference_image')]),
+        (inputnode, n4itk, [('epi_mean', 'input_image')]),
+        (inputnode, epimask, [('epi_mask', 'mask_file')]),
+        (n4itk, epimask, [('output_image', 'in_file')]),
+        (brainmask, norm, [('out_file', 'reference_image')]),
+        (epimask, norm, [('out_file', 'moving_image')]),
+        (norm, invt, [
+            ('reverse_transforms', 'transforms'),
+            ('reverse_invert_flags', 'invert_transform_flags')]),
+        (invt, outputnode, [('output_image', 'epi_parc')]),
+        (norm, outputnode, [('warped_image', 'epi_mni')]),
 
     ])
     return workflow
@@ -691,7 +687,7 @@ def _parse_tout(in_file):
     return data.mean()
 
 
-def _big_plot(in_func, in_mask, in_segm, in_spikes, in_spikes_bg,
+def _big_plot(session_id, task_id, run_id, in_func, in_mask, in_segm, in_spikes, in_spikes_bg,
               fd, dvars, outliers, out_file=None):
     import os.path as op
     import numpy as np
@@ -702,7 +698,20 @@ def _big_plot(in_func, in_mask, in_segm, in_spikes, in_spikes_bg,
             fname, _ = op.splitext(fname)
         out_file = op.abspath('{}_fmriplot.svg'.format(fname))
 
-    myplot = fMRIPlot(in_func, in_mask, in_segm)
+    title = 'fMRI Summary plot.'
+    title_extra = []
+    if session_id is not None and session_id:
+        title_extra.append(session_id)
+    if task_id is not None and task_id:
+        title_extra.append(task_id)
+    if run_id is not None and run_id:
+        title_extra.append(run_id)
+
+    if title_extra:
+        title = title[:-1] + ' (%s).' % ', '.join(title_extra)
+
+    myplot = fMRIPlot(
+        in_func, in_mask, in_segm, title=title)
     # myplot.add_spikes(np.loadtxt(in_spikes), title='Axial slice homogeneity (brain mask)')
     myplot.add_spikes(np.loadtxt(in_spikes_bg),
                       zscored=False)
