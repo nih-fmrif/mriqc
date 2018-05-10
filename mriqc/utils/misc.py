@@ -215,9 +215,15 @@ def generate_csv(derivatives_dir, output_dir, mod):
 
 
 def _read_and_save(in_file):
-    with open(in_file, 'r') as jsondata:
-        data = json.load(jsondata)
-    return data if data else None
+    try:
+        with open(in_file, 'r') as jsondata:
+            data = json.load(jsondata)
+        return data if data else None
+    except json.decoder.JSONDecodeError:
+        with open(in_file, 'r') as jsondata:
+            json_string = ' '.join([js.strip() for js in jsondata.readlines()])
+            data = json.loads(json_string[:-1])
+
 
 
 def _flatten(in_dict, parent_key='', sep='_'):
